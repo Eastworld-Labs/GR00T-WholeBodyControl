@@ -1604,6 +1604,28 @@ class PoseStreamer:
         self.frame_start = time.time()
 
 
+def setup_usb_adb_reverse() -> None:
+    """Set up adb reverse tunnels for USB-only Pico connectivity (body tracking only).
+
+    Note: WebRTC camera streaming does NOT work over ADB (Android's libwebrtc
+    rejects loopback ICE candidates). Use Ethernet adapters for camera support.
+    """
+    commands = [
+        ["adb", "reverse", "tcp:63901", "tcp:63901"],
+        ["adb", "reverse", "tcp:7880", "tcp:7880"],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            print(f"[USB] OK: {' '.join(cmd)}")
+        except FileNotFoundError:
+            print("[USB] adb not found in PATH. Install Android platform-tools or disable --usb.")
+            return
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            print(f"[USB] Failed: {' '.join(cmd)}" + (f" | {stderr}" if stderr else ""))
+
+
 def _init_input_source(
     input_source: str,
     buffer_size: int,
@@ -1648,8 +1670,11 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    usb: bool = False,
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
+    if usb:
+        setup_usb_adb_reverse()
     reader = _init_input_source(input_source, buffer_size)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1970,6 +1995,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    usb: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1980,6 +2006,8 @@ def run_pico_manager(
       Hold X / hold Y: previous / next locomotion mode (planner modes)
       Right stick click: gait SLOW_WALK(slowest) -> SLOW_WALK(medium) -> WALK
     """
+    if usb:
+        setup_usb_adb_reverse()
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
@@ -2356,6 +2384,11 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--usb",
+        action="store_true",
+        help="Set up USB adb reverse tunnels (tcp:63901 and tcp:7880) before starting",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2397,6 +2430,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            usb=args.usb,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2413,4 +2447,5 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            usb=args.usb,
         )
