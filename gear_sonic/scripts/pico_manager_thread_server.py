@@ -51,6 +51,7 @@ try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
         build_command_message,
         build_planner_message,
+        build_recorder_message,
         pack_pose_message,
     )
 except ImportError:
@@ -60,6 +61,9 @@ except ImportError:
 
     def build_planner_message(*args, **kwargs) -> bytes:
         raise RuntimeError("build_planner_message unavailable")
+
+    def build_recorder_message(*args, **kwargs) -> bytes:
+        raise RuntimeError("build_recorder_message unavailable")
 
     def pack_pose_message(*args, **kwargs) -> bytes:
         raise RuntimeError("pack_pose_message unavailable")
@@ -121,6 +125,41 @@ class LocomotionMode(IntEnum):
     FORWARD_JUMP = 17
     STEALTH_WALK = 18
     INJURED_WALK = 19
+
+
+class SlowWalkProfile(Enum):
+    """Speed profile for LocomotionMode.SLOW_WALK (cycled with the right stick click)."""
+
+    SLOWEST = 0  # speed = 0.25 * mag
+    MEDIUM = 1  # speed = 0.1 + 0.25 * mag
+
+
+# Manager button timing (Eastworld controls).
+COMBO_DEBOUNCE_S = 0.25  # min time between two presses of the same combo
+MODE_SWITCH_COOLDOWN_S = 0.6  # min time between two stream-mode switches
+HOLD_S = 1.0  # single-button holds: A next task, B discard, X/Y previous/next locomotion mode
+
+
+class _HoldTrigger:
+    """Fires once when a button has been held (alone) for hold_s seconds."""
+
+    def __init__(self, hold_s: float = HOLD_S):
+        self.hold_s = hold_s
+        self.started_ts = None
+        self.fired = False
+
+    def update(self, pressed: bool, now_ts: float) -> bool:
+        if not pressed:
+            self.started_ts = None
+            self.fired = False
+            return False
+        if self.started_ts is None:
+            self.started_ts = now_ts
+            return False
+        if not self.fired and (now_ts - self.started_ts) >= self.hold_s:
+            self.fired = True
+            return True
+        return False
 
 
 class StreamMode(Enum):
@@ -1731,10 +1770,12 @@ class PlannerStreamer:
         )
 
         self.dt = 1.0 / max(1, poll_hz)
-        # Current locomotion mode, default IDLE
-        self.mode = LocomotionMode.IDLE
-        self.prev_ab = False
-        self.prev_xy = False
+        # Locomotion mode. A+B / X+Y belong to the manager (start/stop, recovery), so
+        # the gait is cycled with the right stick click instead, starting at the
+        # slowest walk.
+        self.mode = LocomotionMode.SLOW_WALK
+        self.slow_walk_profile = SlowWalkProfile.SLOWEST
+        self.prev_right_axis_click = False
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
@@ -1746,6 +1787,14 @@ class PlannerStreamer:
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
         self.yaw_accumulator.reset()
+
+    def step_locomotion_mode(self, step: int) -> None:
+        """Go to the next (+1) or previous (-1) locomotion mode, clamped to the enum."""
+        index = max(int(LocomotionMode.IDLE), min(int(LocomotionMode.INJURED_WALK), self.mode + step))
+        self.mode = LocomotionMode(index)
+        if self.mode == LocomotionMode.SLOW_WALK:
+            self.slow_walk_profile = SlowWalkProfile.SLOWEST
+        print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
 
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
@@ -1780,18 +1829,24 @@ class PlannerStreamer:
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
-            # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
-            ab_now = bool(a_pressed) and bool(b_pressed)
-            xy_now = bool(x_pressed) and bool(y_pressed)
-            if ab_now and not self.prev_ab:
-                self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
-                print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            if xy_now and not self.prev_xy:
-                self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
-                print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            self.prev_ab = ab_now
-            self.prev_xy = xy_now
+            # Right stick click cycles the gait:
+            #   SLOW_WALK(slowest) -> SLOW_WALK(medium) -> WALK -> SLOW_WALK(slowest)
+            _, right_axis_click = get_axis_clicks(self.reader)
+            if right_axis_click and not self.prev_right_axis_click:
+                if self.mode == LocomotionMode.SLOW_WALK:
+                    if self.slow_walk_profile == SlowWalkProfile.SLOWEST:
+                        self.slow_walk_profile = SlowWalkProfile.MEDIUM
+                    else:
+                        self.mode = LocomotionMode.WALK
+                else:
+                    self.mode = LocomotionMode.SLOW_WALK
+                    self.slow_walk_profile = SlowWalkProfile.SLOWEST
+                if self.mode == LocomotionMode.SLOW_WALK:
+                    gait_label = f"SLOW_WALK({self.slow_walk_profile.name})"
+                else:
+                    gait_label = self.mode.name
+                print(f"[PlannerLoop] Gait -> {gait_label}")
+            self.prev_right_axis_click = bool(right_axis_click)
 
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes(self.reader)
@@ -1812,7 +1867,10 @@ class PlannerStreamer:
                 mode_to_send = self.mode
 
                 if self.mode == LocomotionMode.SLOW_WALK:
-                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
+                    if self.slow_walk_profile == SlowWalkProfile.SLOWEST:
+                        speed = 0.25 * mag  # 0 .. 0.25
+                    else:
+                        speed = 0.1 + 0.25 * mag  # 0.1 .. 0.35
                 elif self.mode == LocomotionMode.WALK:
                     speed = -1.0
                 elif self.mode == LocomotionMode.RUN:
@@ -1915,9 +1973,12 @@ def run_pico_manager(
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
-    Controller input:
-      A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+    Controller input (Eastworld controls, see the comment block below):
+      A+B: start / stop the policy        A+B+X+Y: emergency stop, exit
+      A+X: PLANNER <-> POSE               B+Y: POSE <-> PLANNER_FROZEN_UPPER_BODY
+      Left menu: toggle recording         Hold A / hold B: next task / discard recording
+      Hold X / hold Y: previous / next locomotion mode (planner modes)
+      Right stick click: gait SLOW_WALK(slowest) -> SLOW_WALK(medium) -> WALK
     """
     reader = _init_input_source(input_source, buffer_size)
 
@@ -1963,112 +2024,150 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
     )
 
-    # State machine diagram:
+    # Eastworld controls (from Eastworld-Labs/SONIC feat/nondockerjx, with vanilla A+X/B+Y):
     #
-    #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(by)--> PLANNER_FROZEN_UPPER_BODY <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                                         |
-    #                                                                    (by)--> POSE
+    #   OFF --(A+B)--> PLANNER --(A+X)--> POSE --(B+Y)--> PLANNER_FROZEN_UPPER_BODY
+    #                  PLANNER <--(A+X)-- POSE <--(B+Y)-- PLANNER_FROZEN_UPPER_BODY
+    #   A+B while running: stop the policy (the vanilla deploy cannot restart after a stop)
+    #   A+B+X+Y from any mode: emergency stop and exit the manager
+    #   X+Y: reserved for fall recovery (not supported by the vanilla deploy; ignored)
+    #   Left menu: toggle recording; hold A 1 s: next task; hold B 1 s: discard
+    #   Hold X / hold Y 1 s (planner modes): previous / next locomotion mode
+    #   Left stick click: unbound (no VR_3PT, no neck)
     #
-    #   Chain 2 (ax_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(ax)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                        |
-    #                                                   (ax)--> POSE
+    # Combos are exclusive: a four-button press never also fires a two-button combo,
+    # and holds only count a button pressed on its own.
     #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
-    #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
-    #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+B=start/stop, A+B+X+Y=emergency stop, A+X=PLANNER<->POSE, "
+        "B+Y=POSE<->FROZEN_UPPER, menu=record, hold A=next task, hold B=discard, "
+        "hold X/Y=prev/next locomotion mode, right stick click=gait"
+    )
     current_mode = StreamMode.OFF
-    # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
+    # VR_3PT is not reachable with the Eastworld bindings (left stick click is unbound);
+    # its vanilla transition handling below is kept so it can be rebound later.
+    # Track which mode VR_3PT was entered from.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
     try:
+        prev_emergency = False
+        prev_ab_pressed = False
         prev_ax_pressed = False
         prev_by_pressed = False
-        prev_start_combo = False
-        prev_left_axis_click = False
+        prev_xy_pressed = False
+        prev_left_menu = False
+        last_combo_press_ts = {
+            name: float("-inf") for name in ("emergency", "ab", "ax", "by", "xy", "left_menu")
+        }
+        last_mode_change_ts = float("-inf")
+        policy_stopped = False  # the vanilla deploy ignores start after a stop
+        hold_next_task = _HoldTrigger()
+        hold_discard = _HoldTrigger()
+        hold_prev_mode = _HoldTrigger()
+        hold_next_mode = _HoldTrigger()
         while True:
+            now_ts = time.monotonic()
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
+            a, b, x, y = bool(a_pressed), bool(b_pressed), bool(x_pressed), bool(y_pressed)
 
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            left_menu = bool(left_menu_button)
 
-            left_axis_click, _ = get_axis_clicks(reader)
+            emergency = a and b and x and y
+            ab_pressed = a and b and not x and not y
+            ax_pressed = a and x and not b and not y
+            by_pressed = b and y and not a and not x
+            xy_pressed = x and y and not a and not b
 
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            ax_pressed = (a_pressed) and (x_pressed)
+            def rising(name, pressed, prev):
+                """Debounced rising edge of one combo."""
+                if pressed and not prev and (now_ts - last_combo_press_ts[name]) >= COMBO_DEBOUNCE_S:
+                    last_combo_press_ts[name] = now_ts
+                    return True
+                return False
 
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
-            by_pressed = (b_pressed) and (y_pressed)
+            edge_emergency = rising("emergency", emergency, prev_emergency)
+            edge_ab = rising("ab", ab_pressed, prev_ab_pressed)
+            edge_ax = rising("ax", ax_pressed, prev_ax_pressed)
+            edge_by = rising("by", by_pressed, prev_by_pressed)
+            edge_xy = rising("xy", xy_pressed, prev_xy_pressed)
+            edge_left_menu = rising("left_menu", left_menu, prev_left_menu)
+            mode_switch_allowed = (now_ts - last_mode_change_ts) >= MODE_SWITCH_COOLDOWN_S
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
-            start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            if edge_emergency:
+                # From any mode, including OFF: stop the policy and exit the manager.
+                socket.send(build_command_message(start=False, stop=True, planner=True))
+                print("[Manager] *** EMERGENCY STOP (A+B+X+Y): stop sent, exiting ***")
+                exit()
 
             new_mode = current_mode
-            if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
+            if edge_xy:
+                # Reserved for fall recovery (try_recover). The vanilla deploy has no
+                # recovery state machine, so this does nothing for now.
+                print("[Manager] X+Y: recovery is not supported by this deploy (ignored)")
+
+            elif edge_ab:
+                if not mode_switch_allowed:
+                    print("[Manager] Ignored A+B (mode-switch cooldown)")
+                elif current_mode == StreamMode.OFF:
+                    if policy_stopped:
+                        print(
+                            "[Manager] The deploy cannot restart after a stop. Restart "
+                            "sonic_deploy on the robot and this manager, then press A+B."
+                        )
                     else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
-
-            elif current_mode == StreamMode.PLANNER:
-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.PLANNER
+                        # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
+                        # Uses the current Pico SMPL frame + FK of all-zero body joints.
+                        sample = reader.get_latest()
+                        if sample is not None:
+                            three_point.calibrate_now(sample["body_poses_np"])
+                        else:
+                            print("[Manager] WARNING: No SMPL data available for calibration")
+                else:
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
+
+            elif edge_ax and mode_switch_allowed:
+                # A+X: PLANNER <-> POSE
+                if current_mode == StreamMode.PLANNER:
                     new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
+                elif current_mode == StreamMode.POSE:
+                    new_mode = StreamMode.PLANNER
 
-            elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.PLANNER  # Enter chain 2
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
-                elif left_menu_button:
-                    new_mode = StreamMode.POSE_PAUSE
-
-            elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-
-            elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
+            elif edge_by and mode_switch_allowed:
+                # B+Y: POSE <-> PLANNER_FROZEN_UPPER_BODY
+                if current_mode == StreamMode.POSE:
+                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY
+                elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                     new_mode = StreamMode.POSE
 
-            elif current_mode == StreamMode.PLANNER_VR_3PT:
-                # VR_3PT is reachable from both chains:
-                #   left_axis_click → return to parent (PLANNER or FROZEN)
-                #   ax_pressed      → POSE (chain 2 exit)
-                #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
+            # Recorder (g1_dataset_recorder subscribes to the 'recorder' topic).
+            if edge_left_menu:
+                socket.send(build_recorder_message("toggle_record"))
+                print("[Manager] Recorder: toggle_record")
+            if hold_next_task.update(a and not b and not x and not y, now_ts):
+                socket.send(build_recorder_message("next_task"))
+                print("[Manager] Recorder: next_task")
+            if hold_discard.update(b and not a and not x and not y, now_ts):
+                socket.send(build_recorder_message("discard"))
+                print("[Manager] Recorder: discard")
+
+            # Locomotion mode: hold X / hold Y, only while the planner drives the legs.
+            in_planner = current_mode in (
+                StreamMode.PLANNER,
+                StreamMode.PLANNER_FROZEN_UPPER_BODY,
+            )
+            if hold_prev_mode.update(x and not a and not b and not y, now_ts) and in_planner:
+                planner_streamer.step_locomotion_mode(-1)
+            if hold_next_mode.update(y and not a and not b and not x, now_ts) and in_planner:
+                planner_streamer.step_locomotion_mode(+1)
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
+                last_mode_change_ts = now_ts
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
 
@@ -2110,7 +2209,11 @@ def run_pico_manager(
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    policy_stopped = True
+                    print(
+                        "[Manager] Policy stopped. Recorder buttons keep working; restart "
+                        "sonic_deploy on the robot and this manager to run the policy again."
+                    )
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2141,10 +2244,12 @@ def run_pico_manager(
                 )
             )
 
+            prev_emergency = emergency
+            prev_ab_pressed = ab_pressed
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
-            prev_start_combo = start_combo
-            prev_left_axis_click = left_axis_click
+            prev_xy_pressed = xy_pressed
+            prev_left_menu = left_menu
 
     except KeyboardInterrupt:
         print("\nStopping manager...")

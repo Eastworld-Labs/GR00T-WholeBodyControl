@@ -130,6 +130,35 @@ When you turn on the visualization, wait for a window to pop up showing a Unitre
 
 (pico-controls)=
 
+## Eastworld Controls (this fork)
+
+```{admonition} Eastworld-Labs fork
+:class: important
+`gear_sonic/scripts/pico_manager_thread_server.py` in this fork uses the Eastworld
+station controls (from Eastworld-Labs/SONIC `feat/nondockerjx`, with vanilla A+X and
+B+Y). They replace the vanilla bindings described in the rest of this page wherever
+the two differ. The robot must be in Unitree **development mode** before SONIC starts.
+```
+
+| Action | Button | Notes |
+|---|---|---|
+| **Start / stop policy** | **A+B** | Start: OFF → PLANNER + `CALIB_FULL`. Stop: the vanilla deploy cannot restart after a stop; restart `deploy.sh` and the manager. |
+| **Emergency stop** | **A+B+X+Y** | From any mode: sends stop and exits the manager. |
+| **Toggle POSE** | **A+X** | PLANNER ↔ POSE (whole-body teleop; leaving it returns the whole body to the planner). |
+| **Toggle frozen upper body** | **B+Y** | POSE ↔ PLANNER_FROZEN_UPPER (legs from the planner, arms held at the last POSE snapshot). |
+| **Start / stop recording** | **Left menu** | Sent to g1_dataset_recorder on the `recorder` topic. |
+| **Next recording task** | **Hold A** (1 s, alone) | `next_task` on the `recorder` topic. |
+| **Discard recording** | **Hold B** (1 s, alone) | `discard` on the `recorder` topic. |
+| **Previous / next locomotion mode** | **Hold X / hold Y** (1 s, alone) | Planner modes only (IDLE … INJURED_WALK). |
+| **Gait** | **Right stick click** | SLOW_WALK (slowest) → SLOW_WALK (medium) → WALK → SLOW_WALK (slowest). Starts at the slowest walk. |
+| **Recovery** | **X+Y** | Reserved; not supported by the vanilla deploy (ignored). |
+| **VR_3PT** | — | Not bound (left stick click is unused). |
+| Move / turn | Left stick / right stick (horizontal) | As in vanilla. |
+
+Combos are exclusive (a four-button press never also fires a two-button combo) and
+debounced (0.25 s); stream-mode switches have a 0.6 s cooldown. A+B and X+Y no longer
+cycle locomotion modes.
+
 ## Complete PICO Controls
 
 ### Modes & Calibration

@@ -1,6 +1,8 @@
-"""Builders for ZMQ wire-format messages on the 'command', 'planner', and 'pose' topics.
+"""Builders for ZMQ wire-format messages on the 'command', 'planner', 'pose'
+and 'recorder' topics.
 
 Message layout: [topic_bytes][1024-byte JSON header][packed binary payload].
+Message layout (recorder):             [topic_bytes][msgpack payload].
 The header describes field names, dtypes, and shapes so the receiver can
 deserialize without out-of-band schema knowledge.
 """
@@ -9,6 +11,7 @@ import json
 import struct
 from typing import Sequence
 
+import msgpack
 import numpy as np
 
 HEADER_SIZE = 1280
@@ -222,3 +225,11 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
 
     packed_message = topic_bytes + header_bytes + data_bytes
     return packed_message
+
+
+def build_recorder_message(action: str) -> bytes:
+    """Assemble a 'recorder' topic message (msgpack) for g1_dataset_recorder.
+
+    Actions: "toggle_record", "discard", "next_task".
+    """
+    return b"recorder" + msgpack.packb({"action": action})
