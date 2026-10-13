@@ -25,6 +25,7 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -1626,6 +1627,61 @@ def setup_usb_adb_reverse() -> None:
             print(f"[USB] Failed: {' '.join(cmd)}" + (f" | {stderr}" if stderr else ""))
 
 
+USB_REVERSE_PORTS = (63901, 7880)  # XRoboToolkit service (body tracking), LiveKit
+USB_BRIDGE_POLL_S = 5.0
+
+
+def start_usb_bridge_keeper(poll_s: float = USB_BRIDGE_POLL_S):
+    """Keep the Pico's adb reverse tunnels up for the life of this process.
+
+    setup_usb_adb_reverse() runs once at startup, but a replugged cable or a
+    rebooted headset drops the tunnels. This daemon thread checks every poll_s
+    seconds and re-creates any missing tunnel while a headset is attached. No
+    headset attached is a normal state: it just keeps waiting.
+    """
+    if shutil.which("adb") is None:
+        print("[USB] adb not found in PATH; the USB tunnels will not be kept up.")
+        return None
+
+    def adb(*args):
+        return subprocess.run(
+            ["adb", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+        )
+
+    def attached_serial():
+        for line in adb("devices").stdout.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "device":
+                return fields[0]
+        return None
+
+    def keep():
+        bridged = None
+        while True:
+            try:
+                serial = attached_serial()
+                if serial is None:
+                    if bridged is not None:
+                        print(f"[USB] headset {bridged} disconnected; waiting for it to return")
+                    bridged = None
+                else:
+                    existing = adb("-s", serial, "reverse", "--list").stdout
+                    for port in USB_REVERSE_PORTS:
+                        if f"tcp:{port} tcp:{port}" in existing:
+                            continue
+                        result = adb("-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}")
+                        status = "OK" if result.returncode == 0 else "Failed"
+                        print(f"[USB] {status}: adb reverse tcp:{port} tcp:{port} ({serial})")
+                    bridged = serial
+            except Exception as e:  # never let the keeper kill the manager
+                print(f"[USB] tunnel keeper error: {e}")
+            time.sleep(poll_s)
+
+    thread = threading.Thread(target=keep, name="usb-adb-reverse", daemon=True)
+    thread.start()
+    return thread
+
+
 def _init_input_source(
     input_source: str,
     buffer_size: int,
@@ -1675,6 +1731,7 @@ def run_pico(
     """Run body tracking with real-time visualization and ZMQ streaming."""
     if usb:
         setup_usb_adb_reverse()
+        start_usb_bridge_keeper()
     reader = _init_input_source(input_source, buffer_size)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2008,6 +2065,7 @@ def run_pico_manager(
     """
     if usb:
         setup_usb_adb_reverse()
+        start_usb_bridge_keeper()
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
@@ -2387,7 +2445,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--usb",
         action="store_true",
-        help="Set up USB adb reverse tunnels (tcp:63901 and tcp:7880) before starting",
+        help=(
+            "Set up USB adb reverse tunnels (tcp:63901 and tcp:7880) before starting, and "
+            "re-create them whenever the headset is replugged or reboots"
+        ),
     )
     args = parser.parse_args()
 
