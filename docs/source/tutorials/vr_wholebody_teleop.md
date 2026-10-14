@@ -159,6 +159,11 @@ Combos are exclusive (a four-button press never also fires a two-button combo) a
 debounced (0.25 s); stream-mode switches have a 0.6 s cooldown. A+B and X+Y no longer
 cycle locomotion modes.
 
+In POSE mode the manager also publishes a `body_poses_raw` topic for g1_dataset_recorder,
+just before each `pose` message: the raw XRoboToolkit body poses (24 × `[x, y, z, qx, qy,
+qz, qw]`, Y-up tracking space) and `smpl_trans` (the SMPL root translation). The deploy
+does not subscribe to it, and the `pose` message is unchanged.
+
 ## Complete PICO Controls
 
 ### Modes & Calibration

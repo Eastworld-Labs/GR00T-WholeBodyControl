@@ -1578,6 +1578,25 @@ class PoseStreamer:
                 ),
             }
 
+            # For the dataset recorder: the raw XRoboToolkit body poses (24 x
+            # [x, y, z, qx, qy, qz, qw], Y-up tracking space) and the SMPL root
+            # translation of the latest Pico sample. They go on their own topic,
+            # which the deploy does not subscribe to, because the pose header is
+            # capped at 1280 bytes. Sent first so the recorder merges them into
+            # this pose frame.
+            raw_body_message = pack_pose_message(
+                {
+                    "body_poses_raw": np.asarray(sample["body_poses_np"], dtype=np.float32),
+                    "smpl_trans": latest_data["adjusted_transl"]
+                    .detach()
+                    .cpu()
+                    .numpy()[0]
+                    .astype(np.float32),
+                },
+                topic="body_poses_raw",
+            )
+            self.socket.send(raw_body_message)
+
             packed_message = pack_pose_message(numpy_data, topic="pose")
             self.socket.send(packed_message)
 
