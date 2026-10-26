@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import json
 import os
 import shutil
 import subprocess
@@ -139,6 +140,13 @@ class SlowWalkProfile(Enum):
 COMBO_DEBOUNCE_S = 0.25  # min time between two presses of the same combo
 MODE_SWITCH_COOLDOWN_S = 0.6  # min time between two stream-mode switches
 HOLD_S = 1.0  # single-button holds: A next task, B discard, X/Y previous/next locomotion mode
+
+# --hand_buttons: raw controller state for a hand bridge on the robot (robotic_runner
+# services/inspire_hand_ftp/pico_inspire_bridge.py), JSON after this topic prefix. No other
+# subscriber of this socket filters on a prefix of it, so they never see it.
+HAND_BUTTONS_TOPIC = b"pico_buttons"
+HAND_BUTTONS_HZ = 50.0
+HAND_CHORD_THRESHOLD = 0.3  # a trigger/grip past this while X is held is a thumb chord
 
 
 class _HoldTrigger:
@@ -1890,8 +1898,14 @@ class PlannerStreamer:
         self.yaw_accumulator.reset()
 
     def step_locomotion_mode(self, step: int) -> None:
-        """Go to the next (+1) or previous (-1) locomotion mode, clamped to the enum."""
-        index = max(int(LocomotionMode.IDLE), min(int(LocomotionMode.INJURED_WALK), self.mode + step))
+        """Go to the next (+1) or previous (-1) locomotion mode, from SLOW_WALK to the enum's end.
+
+        Never IDLE: a centred left stick already sends IDLE, and an IDLE mode would make the
+        stick send IDLE too, so the robot could only turn on the spot.
+        """
+        index = max(
+            int(LocomotionMode.SLOW_WALK), min(int(LocomotionMode.INJURED_WALK), self.mode + step)
+        )
         self.mode = LocomotionMode(index)
         if self.mode == LocomotionMode.SLOW_WALK:
             self.slow_walk_profile = SlowWalkProfile.SLOWEST
@@ -2072,6 +2086,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
     usb: bool = False,
+    hand_buttons: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2079,8 +2094,11 @@ def run_pico_manager(
       A+B: start / stop the policy        A+B+X+Y: emergency stop, exit
       A+X: PLANNER <-> POSE               B+Y: POSE <-> PLANNER_FROZEN_UPPER_BODY
       Left menu: toggle recording         Hold A / hold B: next task / discard recording
-      Hold X / hold Y: previous / next locomotion mode (planner modes)
+      Hold X / hold Y: previous / next locomotion mode (planner modes; X stops at SLOW_WALK)
       Right stick click: gait SLOW_WALK(slowest) -> SLOW_WALK(medium) -> WALK
+    hand_buttons: also publish triggers, grips and A/B/X/Y on HAND_BUTTONS_TOPIC, and do
+      not count an X hold that chorded a trigger or grip (X + trigger/grip is the hand
+      bridge's thumb rotation).
     """
     if usb:
         setup_usb_adb_reverse()
@@ -2137,7 +2155,7 @@ def run_pico_manager(
     #   A+B+X+Y from any mode: emergency stop and exit the manager
     #   X+Y: reserved for fall recovery (not supported by the vanilla deploy; ignored)
     #   Left menu: toggle recording; hold A 1 s: next task; hold B 1 s: discard
-    #   Hold X / hold Y 1 s (planner modes): previous / next locomotion mode
+    #   Hold X / hold Y 1 s (planner modes): previous / next locomotion mode (X stops at SLOW_WALK)
     #   Left stick click: unbound (no VR_3PT, no neck)
     #
     # Combos are exclusive: a four-button press never also fires a two-button combo,
@@ -2172,14 +2190,44 @@ def run_pico_manager(
         hold_discard = _HoldTrigger()
         hold_prev_mode = _HoldTrigger()
         hold_next_mode = _HoldTrigger()
+        x_chorded = False
+        last_hand_buttons_ts = float("-inf")
         while True:
             now_ts = time.monotonic()
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
             a, b, x, y = bool(a_pressed), bool(b_pressed), bool(x_pressed), bool(y_pressed)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            (
+                left_menu_button,
+                left_trigger_mgr,
+                right_trigger_mgr,
+                left_grip_mgr,
+                right_grip_mgr,
+            ) = get_controller_inputs(reader)
             left_menu = bool(left_menu_button)
+
+            if hand_buttons:
+                hand_input = max(left_trigger_mgr, right_trigger_mgr, left_grip_mgr, right_grip_mgr)
+                x_chorded = x and (x_chorded or hand_input > HAND_CHORD_THRESHOLD)
+                if now_ts - last_hand_buttons_ts >= 1.0 / HAND_BUTTONS_HZ:
+                    last_hand_buttons_ts = now_ts
+                    socket.send(
+                        HAND_BUTTONS_TOPIC
+                        + json.dumps(
+                            {
+                                "t": time.time(),
+                                "left_trigger": float(left_trigger_mgr),
+                                "left_grip": float(left_grip_mgr),
+                                "right_trigger": float(right_trigger_mgr),
+                                "right_grip": float(right_grip_mgr),
+                                "a": a,
+                                "b": b,
+                                "x": x,
+                                "y": y,
+                            }
+                        ).encode("utf-8")
+                    )
 
             emergency = a and b and x and y
             ab_pressed = a and b and not x and not y
@@ -2265,7 +2313,8 @@ def run_pico_manager(
                 StreamMode.PLANNER,
                 StreamMode.PLANNER_FROZEN_UPPER_BODY,
             )
-            if hold_prev_mode.update(x and not a and not b and not y, now_ts) and in_planner:
+            x_alone = x and not a and not b and not y and not x_chorded
+            if hold_prev_mode.update(x_alone, now_ts) and in_planner:
                 planner_streamer.step_locomotion_mode(-1)
             if hold_next_mode.update(y and not a and not b and not x, now_ts) and in_planner:
                 planner_streamer.step_locomotion_mode(+1)
@@ -2469,6 +2518,15 @@ if __name__ == "__main__":
             "re-create them whenever the headset is replugged or reboots"
         ),
     )
+    parser.add_argument(
+        "--hand_buttons",
+        action="store_true",
+        help=(
+            "Manager: publish triggers, grips and A/B/X/Y on the 'pico_buttons' topic for a "
+            "hand bridge on the robot (Inspire hands); X + trigger/grip then no longer counts "
+            "as an X hold"
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2511,6 +2569,7 @@ if __name__ == "__main__":
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
             usb=args.usb,
+            hand_buttons=args.hand_buttons,
         )
     else:
         # Run legacy single-thread pose streaming
