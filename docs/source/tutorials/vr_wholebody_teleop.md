@@ -149,7 +149,7 @@ the two differ. The robot must be in Unitree **development mode** before SONIC s
 | **Start / stop recording** | **Left menu** | Sent to g1_dataset_recorder on the `recorder` topic. |
 | **Next recording task** | **Hold A** (1 s, alone) | `next_task` on the `recorder` topic. |
 | **Discard recording** | **Hold B** (1 s, alone) | `discard` on the `recorder` topic. |
-| **Previous / next locomotion mode** | **Hold X / hold Y** (1 s, alone) | Planner modes only (IDLE … INJURED_WALK). |
+| **Previous / next locomotion mode** | **Hold X / hold Y** (1 s, alone) | Planner modes only (SLOW_WALK … INJURED_WALK). Hold X stops at SLOW_WALK: in IDLE the left stick also sends IDLE, so the robot could only turn. |
 | **Gait** | **Right stick click** | SLOW_WALK (slowest) → SLOW_WALK (medium) → WALK → SLOW_WALK (slowest). Starts at the slowest walk. |
 | **Recovery** | **X+Y** | Reserved; not supported by the vanilla deploy (ignored). |
 | **VR_3PT** | — | Not bound (left stick click is unused). |
@@ -158,6 +158,19 @@ the two differ. The robot must be in Unitree **development mode** before SONIC s
 Combos are exclusive (a four-button press never also fires a two-button combo) and
 debounced (0.25 s); stream-mode switches have a 0.6 s cooldown. A+B and X+Y no longer
 cycle locomotion modes.
+
+### Inspire hands (`--hand_buttons`)
+
+With `--hand_buttons` (robotic_runner's `nvidia_inspire` station) the manager also publishes
+the triggers, grips and A/B/X/Y on a `pico_buttons` topic (JSON, 50 Hz, every mode), and a
+bridge on the robot (robotic_runner `services/inspire_hand_ftp/pico_inspire_bridge.py`) drives
+the Inspire hands from it. SONIC's own Dex3 hand output is not used.
+
+| Action | Button | Notes |
+|---|---|---|
+| **Open / close hand** | **Hold trigger / hold grip** | Each controller drives its own hand; speed follows the press. Released, the hand holds. |
+| **Full hand ↔ pinch** | **Tap Y** (< 1 s, alone) | Both hands. PINCH moves index + thumb only. Held past 1 s it is the locomotion-mode hold instead. |
+| **Rotate thumb in / out** | **Hold X + trigger / grip** | Both hands. An X hold that includes a trigger or grip never steps the locomotion mode. |
 
 In POSE mode the manager also publishes a `body_poses_raw` topic for g1_dataset_recorder,
 just before each `pose` message: the raw XRoboToolkit body poses (24 × `[x, y, z, qx, qy,
