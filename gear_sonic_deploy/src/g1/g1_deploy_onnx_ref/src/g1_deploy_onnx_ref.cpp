@@ -4262,7 +4262,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --thermal-squat-temp <C>: a leg/waist motor this hot squats, then stops (default 90; 0 = off)" << std::endl;
     std::cout << "  --thermal-squat-hold <s>: it must stay that hot this long (default 1.0)" << std::endl;
     std::cout << "  --thermal-squat-time <s>: squat this long before the stop (default 3.0)" << std::endl;
-    std::cout << "  --thermal-squat-height <m>: planner squat height, 0.1-0.8 (default 0.3)" << std::endl;
+    std::cout << "  --thermal-squat-height <m>: planner squat height, 0.1-0.8 (default 0.1)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;

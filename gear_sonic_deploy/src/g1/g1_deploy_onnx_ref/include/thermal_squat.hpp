@@ -28,7 +28,7 @@ struct ThermalSquatConfig {
   double hold_s = 1.0;       ///< The motor must stay this hot (sensor readings jump).
   double squat_s = 3.0;      ///< Squatting this long before the stop.
   double max_wait_s = 6.0;   ///< Give up if the planner has not started squatting by then.
-  double height = 0.3;       ///< Planner squat height (the Pico's squat clamps to 0.2).
+  double height = 0.1;       ///< Planner squat height: its lowest, so the drop at the stop is small.
   int first_motor = 0;       ///< Hardware order: 0-11 legs, 12-14 waist. An arm cut-out
   int last_motor = 14;       ///< drops the arm, not the robot, so arms only warn.
 };
