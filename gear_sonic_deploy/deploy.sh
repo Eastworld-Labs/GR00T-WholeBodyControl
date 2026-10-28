@@ -213,6 +213,9 @@ show_usage() {
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
+    echo "  --thermal-squat-temp C  Leg/waist motor temperature that squats, then stops (default 90; 0 = off)"
+    echo "  --thermal-squat-hold S, --thermal-squat-time S, --thermal-squat-height M"
+    echo "                          How long it must last, how long to squat, squat height"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -255,6 +258,7 @@ OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
+THERMAL_SQUAT_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -335,6 +339,14 @@ while [[ $# -gt 0 ]]; do
             MOTOR_KD_SCALES+=("$2")
             shift 2
             ;;
+        --thermal-squat-temp|--thermal-squat-hold|--thermal-squat-time|--thermal-squat-height)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: $1 requires a value${NC}" >&2
+                exit 1
+            fi
+            THERMAL_SQUAT_ARGS+=("$1" "$2")
+            shift 2
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -412,6 +424,7 @@ done
 for scale in "${MOTOR_KD_SCALES[@]}"; do
     EXTRA_ARGS+=("--motor-kd-scale" "$scale")
 done
+EXTRA_ARGS+=("${THERMAL_SQUAT_ARGS[@]}")
 
 # ============================================================================
 # Step 1: Check Prerequisites

@@ -396,6 +396,14 @@ public:
         return {};
     }
 
+    /// @brief Switch to the planner and stay there, ignoring the operator's mode switches
+    ///        (a thermal squat needs it). Safe to call from any thread.
+    /// @return False if this interface cannot switch on its own.
+    virtual bool RequestPlannerMode() { return false; }
+
+    /// @brief Undo RequestPlannerMode(): the operator's mode switches apply again.
+    virtual void ReleasePlannerMode() {}
+
     // ------------------------------------------------------------------
     // Shared stdin buffering
     // ------------------------------------------------------------------

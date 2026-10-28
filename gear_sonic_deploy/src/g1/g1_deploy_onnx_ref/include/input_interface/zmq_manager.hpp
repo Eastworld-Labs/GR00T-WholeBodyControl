@@ -42,6 +42,7 @@
 #ifndef ZMQ_MANAGER_HPP
 #define ZMQ_MANAGER_HPP
 
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <iostream>
@@ -240,7 +241,8 @@ class ZMQManager : public InputInterface {
 
           // Handle mode switching
           ManagedMode new_mode = latest_command_.planner ? ManagedMode::PLANNER : ManagedMode::STREAMED_MOTION;
-          
+          if (force_planner_) new_mode = ManagedMode::PLANNER;  // a thermal squat holds the planner
+
           if (new_mode != active_mode_) {
             // Trigger safety reset on mode switch
             TriggerSafetyReset();
@@ -283,6 +285,17 @@ class ZMQManager : public InputInterface {
           active_mode_ = new_mode;
           latest_command_.valid = false;
         }
+      }
+
+      // A thermal squat asked for the planner and no command has switched to it: switch
+      // as A+X does (safety reset, then handlePlannerInput enables the planner).
+      if (force_planner_ && active_mode_ != ManagedMode::PLANNER) {
+        TriggerSafetyReset();
+        if (pose_interface_) {
+          pose_interface_->TriggerSafetyReset();
+        }
+        active_mode_ = ManagedMode::PLANNER;
+        std::cout << "[ZMQManager] Switched to: PLANNER mode for a thermal squat (safety reset)" << std::endl;
       }
 
       // Update active interface based on mode
@@ -443,6 +456,13 @@ class ZMQManager : public InputInterface {
       }
       return InputInterface::GetLastUpdateTime();
     }
+
+    bool RequestPlannerMode() override {
+      force_planner_ = true;
+      return true;
+    }
+
+    void ReleasePlannerMode() override { force_planner_ = false; }
 
   private:
     // Handle planner mode input (similar to GamepadManager::handleGamepadPlannerInput)
@@ -1248,6 +1268,9 @@ class ZMQManager : public InputInterface {
     /// True when transitioning from streamed-motion (teleop) back to planner mode;
     /// used to keep forwarding VR/hand data from the pose interface until planner is ready.
     bool switch_from_teleop_to_planner_ = false;
+
+    /// Set by RequestPlannerMode() (control thread): hold PLANNER whatever the manager sends.
+    std::atomic<bool> force_planner_{false};
 
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.

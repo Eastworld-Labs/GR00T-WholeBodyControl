@@ -171,6 +171,17 @@ else()
   message(WARNING "⚠️  libzmq not found - skipping zmq_pose_subscriber_test")
 endif()
 
+# Thermal squat timing (pure logic, no robot): target/release/thermal_squat_test
+add_executable(thermal_squat_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/thermal_squat_test.cpp)
+target_include_directories(thermal_squat_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(thermal_squat_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
 find_package(Eigen3 REQUIRED)
 
 set(EXE_INCLUDES
