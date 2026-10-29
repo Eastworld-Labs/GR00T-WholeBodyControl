@@ -104,6 +104,7 @@
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/motor_gain_scaling.hpp"
+#include "../include/thermal_squat.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -299,6 +300,11 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
     MotorGainScaleConfig motor_gain_scales_;
+    // Thermal squat (thermal_squat.hpp): the control thread runs it; the planner thread
+    // squats while thermal_squat_active_ and reports thermal_squat_planned_.
+    ThermalSquat thermal_squat_;
+    std::atomic<bool> thermal_squat_active_{false};
+    std::atomic<bool> thermal_squat_planned_{false};
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
@@ -2180,7 +2186,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      ThermalSquatConfig thermal_squat = {})
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2193,6 +2200,7 @@ class G1Deploy {
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
+        thermal_squat_(thermal_squat),
         last_action {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
@@ -2212,6 +2220,14 @@ class G1Deploy {
       if (!kd_scales.empty()) {
         std::cout << "[INFO] Motor Kd scales (hardware indices): "
                   << kd_scales << std::endl;
+      }
+      if (thermal_squat_.enabled()) {
+        const auto& ts = thermal_squat_.config();
+        std::cout << "[INFO] Thermal squat: a leg/waist motor at >= " << ts.trigger_c << " C for "
+                  << ts.hold_s << " s squats (height " << ts.height << ") for " << ts.squat_s
+                  << " s, then stops" << std::endl;
+      } else {
+        std::cout << "[INFO] Thermal squat: off" << std::endl;
       }
       
       // Initialize ChannelFactory
@@ -2914,6 +2930,50 @@ class G1Deploy {
         }
         high_temp_warning_ = any_high;
         high_temp_message_ = any_high ? high_temp_msg : "";
+
+        // Thermal squat: squat with the planner, then stop, before the motor cuts out.
+        if (thermal_squat_.enabled()) {
+          std::array<int16_t, G1_NUM_MOTOR> hottest{};
+          for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+            hottest[i] = std::max(unitree_joint_state[i].temperature()[0],
+                                  unitree_joint_state[i].temperature()[1]);
+          }
+          const double now_s = std::chrono::duration<double>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          if (thermal_squat_planned_) { thermal_squat_.squat_started(now_s); }
+          const auto before = thermal_squat_.phase();
+          const auto phase = thermal_squat_.update(now_s, hottest);
+          const std::string joint = thermal_squat_.motor() >= 0 ? joint_names_hw[thermal_squat_.motor()] : "";
+          if (before == ThermalSquat::Phase::Off && phase == ThermalSquat::Phase::Squatting) {
+            thermal_squat_active_ = true;
+            // Also holds the planner when already in it, so A+X cannot leave the squat.
+            const bool switching = input_interface_->RequestPlannerMode();
+            const bool in_planner = planner_ && planner_->planner_state_.enabled;
+            std::cout << "[ThermalSquat] " << joint << " at " << thermal_squat_.temp_c()
+                      << " C: squatting, then stopping" << std::endl;
+            if (!switching && !in_planner) {
+              std::cout << "[ThermalSquat] this input cannot switch to the planner: the squat "
+                        << "will be given up unless the planner is enabled" << std::endl;
+            }
+          }
+          if (before != ThermalSquat::Phase::Stop && phase == ThermalSquat::Phase::Stop) {
+            std::cout << "[ThermalSquat] " << joint << ": squatted, stopping (damping)" << std::endl;
+            operator_state.stop = true;
+          }
+          if (before != ThermalSquat::Phase::GaveUp && phase == ThermalSquat::Phase::GaveUp) {
+            // Not stopping: that would make the robot fall for certain. The motor still
+            // protects itself, and the operator, warned, has control back.
+            thermal_squat_active_ = false;
+            input_interface_->ReleasePlannerMode();
+            std::cout << "[ThermalSquat] " << joint << ": no squat after "
+                      << thermal_squat_.config().max_wait_s
+                      << " s, giving up; the operator has control (not stopping)" << std::endl;
+          }
+          if (thermal_squat_active_) {
+            high_temp_warning_ = true;
+            high_temp_message_ = "Overheating at " + joint + ". Squatting down.";
+          }
+        }
 
         // Print to console at ~1s intervals while overheating (50 Hz control loop)
         if (any_high) {
@@ -3665,6 +3725,12 @@ class G1Deploy {
 
             // Read current movement mode from thread-safe buffer
             auto movement_state_data = movement_state_buffer_.GetDataWithTime();
+            // A thermal squat replaces the operator's command, keeping the heading.
+            if (thermal_squat_active_) {
+              movement_state_data.data = std::make_shared<MovementState>(
+                  static_cast<int>(LocomotionMode::IDEL_SQUAT), std::array<double, 3>{0.0, 0.0, 0.0},
+                  last_movement_state_.facing_direction, -1.0, thermal_squat_.config().height);
+            }
 
             if (movement_state_data.data) {
               // bool of checking if facing direction is changed
@@ -3777,7 +3843,10 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
-              
+              if (thermal_squat_active_ && current_mode == static_cast<int>(LocomotionMode::IDEL_SQUAT)) {
+                thermal_squat_planned_ = true;
+              }
+
             } catch (const std::exception& e) {
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
@@ -4190,6 +4259,10 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --thermal-squat-temp <C>: a leg/waist motor this hot squats, then stops (default 90; 0 = off)" << std::endl;
+    std::cout << "  --thermal-squat-hold <s>: it must stay that hot this long (default 1.0)" << std::endl;
+    std::cout << "  --thermal-squat-time <s>: squat this long before the stop (default 3.0)" << std::endl;
+    std::cout << "  --thermal-squat-height <m>: planner squat height, 0.1-0.8 (default 0.1)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4234,6 +4307,27 @@ int main(int argc, char const* argv[]) {
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   MotorGainScaleConfig motor_gain_scales;
+  ThermalSquatConfig thermal_squat;
+  // --thermal-squat-* <value>: a number within [lo, hi], or exit
+  auto parse_thermal_flag = [&](int& i, double lo, double hi) {
+    if (i + 1 >= argc) {
+      std::cerr << "Error: " << argv[i] << " requires a value argument" << std::endl;
+      exit(1);
+    }
+    double value = 0.0;
+    try {
+      value = std::stod(argv[i + 1]);
+    } catch (...) {
+      std::cerr << "Error: invalid value for " << argv[i] << ": " << argv[i + 1] << std::endl;
+      exit(1);
+    }
+    if (value < lo || value > hi) {
+      std::cerr << "Error: " << argv[i] << " must be between " << lo << " and " << hi << std::endl;
+      exit(1);
+    }
+    ++i;  // the value
+    return value;
+  };
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4473,6 +4567,14 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--thermal-squat-temp") {
+      thermal_squat.trigger_c = parse_thermal_flag(i, 0.0, 125.0);
+    } else if (std::string(argv[i]) == "--thermal-squat-hold") {
+      thermal_squat.hold_s = parse_thermal_flag(i, 0.0, 10.0);
+    } else if (std::string(argv[i]) == "--thermal-squat-time") {
+      thermal_squat.squat_s = parse_thermal_flag(i, 0.5, 10.0);
+    } else if (std::string(argv[i]) == "--thermal-squat-height") {
+      thermal_squat.height = parse_thermal_flag(i, 0.1, 0.8);
     }
   }
 
@@ -4506,7 +4608,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    thermal_squat
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
