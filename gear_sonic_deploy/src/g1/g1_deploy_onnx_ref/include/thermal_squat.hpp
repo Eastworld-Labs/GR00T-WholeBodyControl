@@ -24,8 +24,8 @@
 #include "robot_parameters.hpp"
 
 struct ThermalSquatConfig {
-  double trigger_c = 90.0;   ///< Same as SONIC's spoken warning; 0 disables.
-  double hold_s = 1.0;       ///< The motor must stay this hot (sensor readings jump).
+  double trigger_c = 100.0;  ///< Above normal peaks (85-88 C), 13 s before the cut-out; 0 disables.
+  double hold_s = 2.0;       ///< The motor must stay this hot (sensor readings jump).
   double squat_s = 3.0;      ///< Squatting this long before the stop.
   double max_wait_s = 6.0;   ///< Give up if the planner has not started squatting by then.
   double height = 0.1;       ///< Planner squat height: its lowest, so the drop at the stop is small.
