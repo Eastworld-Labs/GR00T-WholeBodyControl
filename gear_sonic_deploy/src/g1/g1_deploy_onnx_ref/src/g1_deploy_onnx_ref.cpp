@@ -4259,8 +4259,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
-    std::cout << "  --thermal-squat-temp <C>: a leg/waist motor this hot squats, then stops (default 90; 0 = off)" << std::endl;
-    std::cout << "  --thermal-squat-hold <s>: it must stay that hot this long (default 1.0)" << std::endl;
+    std::cout << "  --thermal-squat-temp <C>: a leg/waist motor this hot squats, then stops (default 100; 0 = off)" << std::endl;
+    std::cout << "  --thermal-squat-hold <s>: it must stay that hot this long (default 2.0)" << std::endl;
     std::cout << "  --thermal-squat-time <s>: squat this long before the stop (default 3.0)" << std::endl;
     std::cout << "  --thermal-squat-height <m>: planner squat height, 0.1-0.8 (default 0.1)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
