@@ -24,7 +24,7 @@
 #include "robot_parameters.hpp"
 
 struct ThermalSquatConfig {
-  double trigger_c = 100.0;  ///< Above normal peaks (85-88 C), 13 s before the cut-out; 0 disables.
+  double trigger_c = 110.0;  ///< 10 s before G1-021's 130 C cut-out; ankles peak 98-104 C; 0 disables.
   double hold_s = 2.0;       ///< The motor must stay this hot (sensor readings jump).
   double squat_s = 3.0;      ///< Squatting this long before the stop.
   double max_wait_s = 6.0;   ///< Give up if the planner has not started squatting by then.
