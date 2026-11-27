@@ -146,6 +146,13 @@ HOLD_S = 1.0  # single-button holds: A next task, B discard, X/Y previous/next l
 # subscriber of this socket filters on a prefix of it, so they never see it.
 HAND_BUTTONS_TOPIC = b"pico_buttons"
 HAND_BUTTONS_HZ = 50.0
+
+# --pico_raw: every headset sample, published once on its own topic for recorders (the deploy does
+# not subscribe to it). PicoReader queues each new XRT sample with that moment's headset/controller
+# state; the manager loop drains the queue every cycle, in every mode. The pose stream to the deploy
+# is unchanged. A full queue drops its oldest sample and counts it in the "dropped" field.
+PICO_RAW_TOPIC = "pico_raw"
+PICO_RAW_QUEUE_MAX = 1024  # ~11 s of 90 Hz samples
 HAND_CHORD_THRESHOLD = 0.3  # a trigger/grip past this while X is held is a thumb chord
 
 
@@ -859,6 +866,10 @@ class PicoReader:
         self._last_stamp_ns = None
         self._latest = None
         self._lock = threading.Lock()
+        self.raw_enabled = False  # --pico_raw
+        self._raw = deque()
+        self._raw_seq = 0
+        self._raw_dropped = 0
 
     def start(self):
         self._thread.start()
@@ -870,6 +881,46 @@ class PicoReader:
     def get_latest(self):
         with self._lock:
             return self._latest
+
+    def drain_raw(self):
+        """Every sample queued since the last call (--pico_raw), oldest first."""
+        with self._lock:
+            out = list(self._raw)
+            self._raw.clear()
+        return out
+
+    def _raw_sample(self, body_poses, stamp_ns, t_realtime, t_monotonic, device_dt):
+        """One headset sample as sent on PICO_RAW_TOPIC: poses are [x, y, z, qx, qy, qz, qw]."""
+        self._raw_seq += 1
+        la, ra = xrt.get_left_axis(), xrt.get_right_axis()
+
+        def axis(a, i):
+            return float(a[i]) if len(a) > i else 0.0
+
+        return {
+            "body_poses_raw": np.asarray(body_poses, dtype=np.float32).reshape(-1, 7),
+            "device_poses": np.asarray(  # headset, left controller, right controller
+                [xrt.get_headset_pose(), xrt.get_left_controller_pose(), xrt.get_right_controller_pose()],
+                dtype=np.float32,
+            ),
+            "analog": np.asarray(  # triggers L R, grips L R, left stick x y, right stick x y
+                [xrt.get_left_trigger(), xrt.get_right_trigger(), xrt.get_left_grip(), xrt.get_right_grip(),
+                 axis(la, 0), axis(la, 1), axis(ra, 0), axis(ra, 1)],
+                dtype=np.float32,
+            ),
+            "buttons": np.asarray(  # A B X Y, menu L R, stick click L R
+                [xrt.get_A_button(), xrt.get_B_button(), xrt.get_X_button(), xrt.get_Y_button(),
+                 xrt.get_left_menu_button(), xrt.get_right_menu_button(),
+                 xrt.get_left_axis_click(), xrt.get_right_axis_click()],
+                dtype=np.int32,
+            ),
+            "timestamp_ns": np.array([stamp_ns], dtype=np.int64),  # XRT device time
+            "timestamp_realtime": np.array([t_realtime], dtype=np.float64),
+            "timestamp_monotonic": np.array([t_monotonic], dtype=np.float64),
+            "pico_dt": np.array([device_dt], dtype=np.float32),
+            "frame_index": np.array([self._raw_seq], dtype=np.int64),
+            "dropped": np.array([self._raw_dropped], dtype=np.int64),
+        }
 
     @property
     def disconnected(self) -> bool:
@@ -913,8 +964,18 @@ class PicoReader:
                     "dt": device_dt,
                     "fps": self._fps_ema,
                 }
+                raw = (
+                    self._raw_sample(body_poses, stamp_ns, t_realtime, t_monotonic, device_dt)
+                    if self.raw_enabled
+                    else None
+                )
                 with self._lock:
                     self._latest = sample
+                    if raw is not None:
+                        if len(self._raw) >= PICO_RAW_QUEUE_MAX:
+                            self._raw.popleft()
+                            self._raw_dropped += 1
+                        self._raw.append(raw)
                 now = time.time()
                 if now - last_report >= 5.0:
                     print(
@@ -2087,6 +2148,7 @@ def run_pico_manager(
     input_source: str = "xrt",
     usb: bool = False,
     hand_buttons: bool = False,
+    pico_raw: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2104,6 +2166,13 @@ def run_pico_manager(
         setup_usb_adb_reverse()
         start_usb_bridge_keeper()
     reader = _init_input_source(input_source, buffer_size)
+    if pico_raw:
+        if hasattr(reader, "drain_raw"):
+            reader.raw_enabled = True
+            print(f"[Manager] --pico_raw: every headset sample on topic '{PICO_RAW_TOPIC}'")
+        else:
+            print("[Manager] --pico_raw needs the XRT input source; not publishing raw samples")
+            pico_raw = False
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2194,6 +2263,9 @@ def run_pico_manager(
         last_hand_buttons_ts = float("-inf")
         while True:
             now_ts = time.monotonic()
+            if pico_raw:
+                for raw_sample in reader.drain_raw():
+                    socket.send(pack_pose_message(raw_sample, topic=PICO_RAW_TOPIC))
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
             a, b, x, y = bool(a_pressed), bool(b_pressed), bool(x_pressed), bool(y_pressed)
@@ -2519,6 +2591,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--pico_raw",
+        action="store_true",
+        help=(
+            "Manager: also publish every headset sample once on the 'pico_raw' topic (headset and "
+            "controller poses, triggers, grips, sticks, buttons, body joints, XRT and host time) for "
+            "recorders; the pose stream to the deploy is unchanged"
+        ),
+    )
+    parser.add_argument(
         "--hand_buttons",
         action="store_true",
         help=(
@@ -2570,6 +2651,7 @@ if __name__ == "__main__":
             input_source=args.input_source,
             usb=args.usb,
             hand_buttons=args.hand_buttons,
+            pico_raw=args.pico_raw,
         )
     else:
         # Run legacy single-thread pose streaming
