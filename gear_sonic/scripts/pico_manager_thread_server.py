@@ -2155,7 +2155,7 @@ def run_pico_manager(
     Controller input (Eastworld controls, see the comment block below):
       A+B: start / stop the policy        A+B+X+Y: emergency stop, exit
       A+X: PLANNER <-> POSE               B+Y: POSE <-> PLANNER_FROZEN_UPPER_BODY
-      Left menu or left stick click: toggle recording   Hold A / hold B: next task / discard recording
+      Left menu: toggle recording         Hold A / hold B: next task / discard recording
       Hold X / hold Y: previous / next locomotion mode (planner modes; X stops at SLOW_WALK)
       Right stick click: gait SLOW_WALK(slowest) -> SLOW_WALK(medium) -> WALK
     hand_buttons: also publish triggers, grips and A/B/X/Y on HAND_BUTTONS_TOPIC, and do
@@ -2223,7 +2223,7 @@ def run_pico_manager(
     #   A+B while running: stop the policy (the vanilla deploy cannot restart after a stop)
     #   A+B+X+Y from any mode: emergency stop and exit the manager
     #   X+Y: reserved for fall recovery (not supported by the vanilla deploy; ignored)
-    #   Left menu or left stick click: toggle recording; hold A 1 s: next task; hold B 1 s: discard
+    #   Left menu: toggle recording; hold A 1 s: next task; hold B 1 s: discard
     #   Hold X / hold Y 1 s (planner modes): previous / next locomotion mode (X stops at SLOW_WALK)
     #   Left stick click: unbound (no VR_3PT, no neck)
     #
@@ -2232,7 +2232,7 @@ def run_pico_manager(
     #
     print(
         "Manager controls: A+B=start/stop, A+B+X+Y=emergency stop, A+X=PLANNER<->POSE, "
-        "B+Y=POSE<->FROZEN_UPPER, menu/left stick click=record, hold A=next task, hold B=discard, "
+        "B+Y=POSE<->FROZEN_UPPER, menu=record, hold A=next task, hold B=discard, "
         "hold X/Y=prev/next locomotion mode, right stick click=gait"
     )
     current_mode = StreamMode.OFF
@@ -2277,10 +2277,7 @@ def run_pico_manager(
                 left_grip_mgr,
                 right_grip_mgr,
             ) = get_controller_inputs(reader)
-            # The left stick click toggles recording too: some headsets' XRoboToolkit app never sends
-            # the left menu key (G1-015's PICO 4 Ultra, app 1.1.1). The left stick click is otherwise unused.
-            left_stick_click, _ = get_axis_clicks(reader)
-            left_menu = bool(left_menu_button) or bool(left_stick_click)
+            left_menu = bool(left_menu_button)
 
             if hand_buttons:
                 hand_input = max(left_trigger_mgr, right_trigger_mgr, left_grip_mgr, right_grip_mgr)
